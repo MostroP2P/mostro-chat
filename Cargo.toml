@@ -1,0 +1,16 @@
+[package]
+name = "mostro-chat"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Francisco Calderón <fjcalderon@gmail.com>"]
+description = "Minimalist peer-to-peer chat application written in Rust, utilizing the Nostr protocol for decentralized and secure communication"
+homepage = "https://mostro.network"
+repository = "https://github.com/MostroP2P/mostro-chat"
+
+[dependencies]
+crossterm = { version = "0.28.1", features = ["event-stream"] }
+ratatui = "0.29.0"
+tokio = { version = "1.44.1", features = ["full"] }
+nostr-sdk = { version = "0.40.0", features = ["nip44", "nip59"] }
+clap = { version = "4.5.32", features = ["derive"] }
