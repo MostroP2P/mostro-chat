@@ -11,7 +11,7 @@ use nostr_sdk::{
 use nostr_sdk::prelude::*;
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Layout},
+    layout::{Alignment, Constraint, Layout},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
@@ -51,6 +51,7 @@ struct App {
     tx: Sender<String>,
     sender_keys: Keys,
     shared_keys: Keys,
+    shared_key_display: String,
 }
 
 impl App {
@@ -60,12 +61,14 @@ impl App {
         sender_keys: Keys,
         shared_keys: Keys,
     ) -> Self {
+        let shared_key_display = shared_keys.secret_key().to_secret_hex();
         Self {
             messages,
             input: String::new(),
             tx,
             sender_keys,
             shared_keys,
+            shared_key_display,
         }
     }
 }
@@ -74,7 +77,6 @@ impl App {
 async fn main() -> io::Result<()> {
     // Parse arguments using clap
     let args = Args::parse();
-    // Access the parsed values
     let sender_secret = args.sender_secret;
     let receiver_pubkey_str = args.receiver_pubkey;
 
@@ -96,7 +98,7 @@ async fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // set channel and messages
+    // Set channel and messages
     let (tx, rx) = mpsc::channel(100);
     let messages = Arc::new(Mutex::new(Vec::new()));
 
@@ -106,7 +108,7 @@ async fn main() -> io::Result<()> {
 
     let result = run_app(&mut terminal, app).await;
 
-    // clean up
+    // Clean up
     nostr_handle.abort();
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -119,8 +121,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app:
     loop {
         terminal.draw(|f| {
             let chunks = Layout::vertical([
-                Constraint::Percentage(80), // messages area
-                Constraint::Percentage(20), // input area
+                Constraint::Percentage(70), // Messages area
+                Constraint::Percentage(15), // Shared key area
+                Constraint::Percentage(15), // Input area
             ])
             .split(f.area());
 
@@ -130,28 +133,39 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app:
                 .expect("Error getting current time")
                 .as_secs();
 
-            // Filtrar messages de los últimos N segundos
-            let messages = app.messages.lock().expect("Error al bloquear messages");
+            // Filter messages from the last N seconds
+            let messages = app.messages.lock().expect("Error locking messages");
             let recent_messages: Vec<String> = messages
                 .iter()
                 .filter(|(timestamp, _)| now - timestamp.as_u64() <= N_SECONDS)
                 .map(|(_, msg)| msg.clone())
                 .collect();
 
-            // Mostrar messages recientes
+            // Display recent messages
             let lines: Vec<Line> = recent_messages
                 .iter()
                 .map(|msg| Line::from(Span::raw(msg)))
                 .collect();
             let messages_widget = Paragraph::new(lines)
-                .block(Block::default().title("messages").borders(Borders::ALL));
+                .block(
+                    Block::default()
+                        .title_top(Line::from("Messages").alignment(Alignment::Left)) // Título principal a la izquierda
+                        .title_top(Line::from("ESC to exit").alignment(Alignment::Right)) // Aviso a la derecha
+                        .borders(Borders::ALL)
+                );
             f.render_widget(messages_widget, chunks[0]);
 
-            // Campo de entrada
+            // Display shared key
+            let shared_key_widget = Paragraph::new(app.shared_key_display.as_str())
+                .style(Style::default().fg(Color::Cyan))
+                .block(Block::default().title("Shared Key").borders(Borders::ALL));
+            f.render_widget(shared_key_widget, chunks[1]);
+
+            // Input field
             let input = Paragraph::new(app.input.as_str())
                 .style(Style::default().fg(Color::Yellow))
                 .block(Block::default().title("Input").borders(Borders::ALL));
-            f.render_widget(input, chunks[1]);
+            f.render_widget(input, chunks[2]);
         })?;
 
         if event::poll(Duration::from_millis(100))? {
@@ -165,13 +179,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app:
                     KeyCode::Enter => {
                         if !app.input.is_empty() {
                             let message = format!("You: {}", app.input);
-                            let now = Timestamp::now(); // Timestamp for sent messages
+                            let now = Timestamp::now();
                             {
-                                let mut messages = app.messages.lock().expect("Error al bloquear messages");
+                                let mut messages = app.messages.lock().expect("Error locking messages");
                                 messages.push((now, message));
                             }
                             if let Err(e) = app.tx.send(app.input.clone()).await {
-                                let mut messages = app.messages.lock().expect("Error al bloquear messages");
+                                let mut messages = app.messages.lock().expect("Error locking messages");
                                 messages.push((
                                     Timestamp::now(),
                                     format!("Error sending message: {}", e),
@@ -206,7 +220,6 @@ async fn run_nostr(
     let filter = nostr_sdk::Filter::new()
         .kind(Kind::GiftWrap)
         .pubkey(shared_keys.public_key());
-    // let subscription_id = SubscriptionId::generate();
     if let Err(e) = client.subscribe(filter, None).await {
         eprintln!("Error subscribing: {}", e);
         return;
@@ -231,8 +244,8 @@ async fn run_nostr(
             if let Ok(inner_event) = mostro_unwrap(&shared_keys, *event).await {
                 if inner_event.pubkey != sender_keys.public_key() {
                     let message = format!("Counterpart: {}", inner_event.content);
-                    let created_at = inner_event.created_at; // We use the created_at of the inner_event
-                    let mut messages = messages.lock().expect("Error blocking messages");
+                    let created_at = inner_event.created_at;
+                    let mut messages = messages.lock().expect("Error locking messages");
                     messages.push((created_at, message));
                 }
             }
@@ -251,7 +264,7 @@ async fn send_message(
     Ok(())
 }
 
-/// Wraps a message in a non standard and simplified NIP-59 event.
+/// Wraps a message in a non-standard and simplified NIP-59 event.
 /// The inner event is signed with the sender's key and encrypted to the receiver's
 /// public key using an ephemeral key.
 ///
@@ -296,7 +309,7 @@ pub async fn mostro_wrap(
     Ok(wrapped_event)
 }
 
-/// Unwraps an non standard NIP-59 event and retrieves the inner event.
+/// Unwraps a non-standard NIP-59 event and retrieves the inner event.
 /// The receiver uses their private key to decrypt the content.
 ///
 /// # Arguments
