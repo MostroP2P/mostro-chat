@@ -37,29 +37,35 @@ const POW_DIFFICULTY: u8 = 2;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Sender's private key (hex or bech32)
-    #[arg(short = 's', long = "sender-secret")]
-    sender_secret: String,
+    #[arg(short = 's', long = "sender-secret", requires = "receiver_pubkey")]
+    sender_secret: Option<String>,
 
     /// Receiver's public key (hex or bech32)
-    #[arg(short = 'p', long = "receiver-pubkey")]
-    receiver_pubkey: String,
+    #[arg(short = 'p', long = "receiver-pubkey", requires = "sender_secret")]
+    receiver_pubkey: Option<String>,
+
+    /// Shared secret key (hex)
+    #[arg(short = 'k', long = "shared-key", conflicts_with_all = ["sender_secret", "receiver_pubkey"])]
+    shared_key: Option<String>,
 }
 
 struct App {
-    messages: Arc<Mutex<Vec<(Timestamp, String)>>>, // Store (timestamp, message)
+    messages: Arc<Mutex<Vec<(Timestamp, PublicKey, String)>>>, // Store (timestamp, sender pubkey, message)
     input: String,
-    tx: Sender<String>,
-    sender_keys: Keys,
+    tx: Option<Sender<String>>, // Only used in participant mode
+    sender_keys: Option<Keys>,  // Only used in participant mode
     shared_keys: Keys,
     shared_key_display: String,
+    is_observer: bool,          // Flag to indicate observer mode (with -k)
 }
 
 impl App {
     fn new(
-        messages: Arc<Mutex<Vec<(Timestamp, String)>>>,
-        tx: Sender<String>,
-        sender_keys: Keys,
+        messages: Arc<Mutex<Vec<(Timestamp, PublicKey, String)>>>,
+        tx: Option<Sender<String>>,
+        sender_keys: Option<Keys>,
         shared_keys: Keys,
+        is_observer: bool,
     ) -> Self {
         let shared_key_display = shared_keys.secret_key().to_secret_hex();
         Self {
@@ -69,6 +75,7 @@ impl App {
             sender_keys,
             shared_keys,
             shared_key_display,
+            is_observer,
         }
     }
 }
@@ -77,19 +84,30 @@ impl App {
 async fn main() -> io::Result<()> {
     // Parse arguments using clap
     let args = Args::parse();
-    let sender_secret = args.sender_secret;
-    let receiver_pubkey_str = args.receiver_pubkey;
 
-    // Parse keys
-    let sender_keys = Keys::parse(&sender_secret).expect("Invalid sender's private key");
-    let receiver_pubkey =
-        PublicKey::from_str(&receiver_pubkey_str).expect("Invalid recipient public key");
+    let shared_keys: Keys;
+    let mut sender_keys: Option<Keys> = None;
+    let is_observer = args.shared_key.is_some();
 
-    // Generating shared key
-    let shared_key = nostr_sdk::util::generate_shared_key(sender_keys.secret_key(), &receiver_pubkey)
-        .expect("Error generating shared key");
-    let shared_secret_key = SecretKey::from_slice(&shared_key).unwrap();
-    let shared_keys = Keys::new(shared_secret_key);
+    if let Some(shared_key_hex) = args.shared_key {
+        // Observer mode: Use the provided shared key
+        let shared_secret_key = SecretKey::from_str(&shared_key_hex).expect("Invalid shared key");
+        shared_keys = Keys::new(shared_secret_key);
+    } else {
+        // Participant mode: Generate shared key from sender and receiver keys
+        let sender_secret = args.sender_secret.expect("Sender secret is required");
+        let receiver_pubkey_str = args.receiver_pubkey.expect("Receiver pubkey is required");
+
+        sender_keys = Some(Keys::parse(&sender_secret).expect("Invalid sender's private key"));
+        let receiver_pubkey = PublicKey::from_str(&receiver_pubkey_str).expect("Invalid recipient public key");
+
+        let shared_key = nostr_sdk::util::generate_shared_key(
+            sender_keys.as_ref().unwrap().secret_key(),
+            &receiver_pubkey,
+        ).expect("Error generating shared key");
+        let shared_secret_key = SecretKey::from_slice(&shared_key).unwrap();
+        shared_keys = Keys::new(shared_secret_key);
+    }
 
     // Init terminal
     enable_raw_mode()?;
@@ -99,12 +117,17 @@ async fn main() -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Set channel and messages
-    let (tx, rx) = mpsc::channel(100);
+    let (tx, rx) = if !is_observer {
+        let (tx, rx) = mpsc::channel(100);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let messages = Arc::new(Mutex::new(Vec::new()));
 
     // Create app and run Nostr client in background
-    let app = App::new(messages.clone(), tx, sender_keys.clone(), shared_keys.clone());
-    let nostr_handle = tokio::spawn(run_nostr(sender_keys, shared_keys, rx, messages.clone()));
+    let app = App::new(messages.clone(), tx, sender_keys.clone(), shared_keys.clone(), is_observer);
+    let nostr_handle = tokio::spawn(run_nostr(sender_keys, shared_keys, rx, messages.clone(), is_observer));
 
     let result = run_app(&mut terminal, app).await;
 
@@ -137,8 +160,20 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app:
             let messages = app.messages.lock().expect("Error locking messages");
             let recent_messages: Vec<String> = messages
                 .iter()
-                .filter(|(timestamp, _)| now - timestamp.as_u64() <= N_SECONDS)
-                .map(|(_, msg)| msg.clone())
+                .filter(|(timestamp, _, _)| now - timestamp.as_u64() <= N_SECONDS)
+                .map(|(_, pubkey, msg)| {
+                    if app.is_observer {
+                        // In observer mode, always show the inner_event pubkey
+                        format!("{}: {}", pubkey.to_string(), msg)
+                    } else {
+                        // In participant mode, show "You:" only if the message is from the sender
+                        if Some(*pubkey) == app.sender_keys.as_ref().map(|k| k.public_key()) {
+                            format!("You: {}", msg)
+                        } else {
+                            format!("{}: {}", pubkey.to_string(), msg)
+                        }
+                    }
+                })
                 .collect();
 
             // Display recent messages
@@ -178,18 +213,23 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app:
                     }
                     KeyCode::Enter => {
                         if !app.input.is_empty() {
-                            let message = format!("You: {}", app.input);
+                            let message = app.input.clone();
                             let now = Timestamp::now();
+                            // Use the sender's public key (from sender_keys) when sending a message in participant mode
+                            let sender_pubkey = app.sender_keys.as_ref().map(|k| k.public_key()).unwrap_or(app.shared_keys.public_key());
                             {
                                 let mut messages = app.messages.lock().expect("Error locking messages");
-                                messages.push((now, message));
+                                messages.push((now, sender_pubkey, message.clone()));
                             }
-                            if let Err(e) = app.tx.send(app.input.clone()).await {
-                                let mut messages = app.messages.lock().expect("Error locking messages");
-                                messages.push((
-                                    Timestamp::now(),
-                                    format!("Error sending message: {}", e),
-                                ));
+                            if let Some(tx) = &app.tx {
+                                if let Err(e) = tx.send(message).await {
+                                    let mut messages = app.messages.lock().expect("Error locking messages");
+                                    messages.push((
+                                        Timestamp::now(),
+                                        sender_pubkey,
+                                        format!("Error sending message: {}", e),
+                                    ));
+                                }
                             }
                             app.input.clear();
                         }
@@ -203,10 +243,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app:
 }
 
 async fn run_nostr(
-    sender_keys: Keys,
+    sender: Option<Keys>,
     shared_keys: Keys,
-    mut rx: Receiver<String>,
-    messages: Arc<Mutex<Vec<(Timestamp, String)>>>,
+    rx: Option<Receiver<String>>,
+    messages: Arc<Mutex<Vec<(Timestamp, PublicKey, String)>>>,
+    is_observer: bool,
 ) {
     // Initialize Nostr client
     let client = Client::new(Keys::generate());
@@ -225,29 +266,32 @@ async fn run_nostr(
         return;
     }
 
-    // Handle outgoing messages
-    let client_clone = client.clone();
-    let sender_keys_clone = sender_keys.clone();
-    let shared_keys_clone = shared_keys.clone();
-    tokio::spawn(async move {
-        while let Some(message) = rx.recv().await {
-            if let Err(e) = send_message(&client_clone, &sender_keys_clone, &shared_keys_clone, &message).await {
-                eprintln!("Error sending message: {}", e);
-            }
+    // Handle outgoing messages (only in participant mode)
+    if !is_observer {
+        let client_clone = client.clone();
+        let receiver_clone = shared_keys.clone(); // Use shared_keys as receiver
+        let sender = sender.expect("Sender keys are required in participant mode");
+        if let Some(mut rx) = rx {
+            tokio::spawn(async move {
+                while let Some(message) = rx.recv().await {
+                    if let Err(e) = send_message(&client_clone, &sender, receiver_clone.public_key(), &message).await {
+                        eprintln!("Error sending message: {}", e);
+                    }
+                }
+            });
         }
-    });
+    }
 
     // Handle incoming messages
     let mut notifications = client.notifications();
     while let Ok(notification) = notifications.recv().await {
         if let RelayPoolNotification::Event { event, .. } = notification {
             if let Ok(inner_event) = mostro_unwrap(&shared_keys, *event).await {
-                if inner_event.pubkey != sender_keys.public_key() {
-                    let message = format!("Counterpart: {}", inner_event.content);
-                    let created_at = inner_event.created_at;
-                    let mut messages = messages.lock().expect("Error locking messages");
-                    messages.push((created_at, message));
-                }
+                let message = inner_event.content.clone();
+                let created_at = inner_event.created_at;
+                let sender_pubkey = inner_event.pubkey;
+                let mut messages = messages.lock().expect("Error locking messages");
+                messages.push((created_at, sender_pubkey, message));
             }
         }
     }
@@ -256,10 +300,10 @@ async fn run_nostr(
 async fn send_message(
     client: &Client,
     sender: &Keys,
-    shared_keys: &Keys,
+    receiver: PublicKey,
     message: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let wrapped_event = mostro_wrap(sender, shared_keys.public_key(), message, vec![]).await?;
+    let wrapped_event = mostro_wrap(sender, receiver, message, vec![]).await?;
     client.send_event(&wrapped_event).await?;
     Ok(())
 }
@@ -305,7 +349,6 @@ pub async fn mostro_wrap(
         .tags(tags)
         .custom_created_at(Timestamp::tweaked(nip59::RANGE_RANDOM_TIMESTAMP_TWEAK))
         .sign_with_keys(&keys)?;
-
     Ok(wrapped_event)
 }
 
