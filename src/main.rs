@@ -149,8 +149,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app:
             let messages_widget = Paragraph::new(lines)
                 .block(
                     Block::default()
-                        .title_top(Line::from("Messages").alignment(Alignment::Left)) // Título principal a la izquierda
-                        .title_top(Line::from("ESC to exit").alignment(Alignment::Right)) // Aviso a la derecha
+                        .title_top(Line::from("Messages").alignment(Alignment::Left))
+                        .title_top(Line::from(Span::styled("ESC to exit", Style::default().fg(Color::Green))).alignment(Alignment::Right))
                         .borders(Borders::ALL)
                 );
             f.render_widget(messages_widget, chunks[0]);
