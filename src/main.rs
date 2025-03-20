@@ -52,11 +52,12 @@ struct Args {
 struct App {
     messages: Arc<Mutex<Vec<(Timestamp, PublicKey, String)>>>, // Store (timestamp, sender pubkey, message)
     input: String,
-    tx: Option<Sender<String>>, // Only used in participant mode
-    sender_keys: Option<Keys>,  // Only used in participant mode
+    tx: Option<Sender<String>>,  // Only used in participant mode
+    sender_keys: Option<Keys>,   // Only used in participant mode
     shared_keys: Keys,
     shared_key_display: String,
-    is_observer: bool,          // Flag to indicate observer mode (with -k)
+    is_observer: bool,           // Flag to indicate observer mode (with -k)
+    is_shared_key_visible: bool, // Flag to control visibility of the shared key
 }
 
 impl App {
@@ -76,6 +77,7 @@ impl App {
             shared_keys,
             shared_key_display,
             is_observer,
+            is_shared_key_visible: false, // Initialize with shared key hidden
         }
     }
 }
@@ -190,10 +192,23 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app:
                 );
             f.render_widget(messages_widget, chunks[0]);
 
-            // Display shared key
-            let shared_key_widget = Paragraph::new(app.shared_key_display.as_str())
+            // Determine the text to display for the shared key
+            let shared_key_text = if app.is_shared_key_visible {
+                app.shared_key_display.as_str()
+            } else {
+                &"*".repeat(64)
+            };
+
+            // Display shared key with toggle label
+            let shared_key_widget = Paragraph::new(shared_key_text)
                 .style(Style::default().fg(Color::Cyan))
-                .block(Block::default().title("Shared Key").borders(Borders::ALL));
+                .block(
+                    Block::default()
+                        .title("Shared Key")
+                        // Add label "tab to display/hide" in the top-right corner
+                        .title_top(Line::from(Span::styled("Tab to Display/Hide", Style::default().fg(Color::Green))).alignment(Alignment::Right))
+                        .borders(Borders::ALL)
+                );
             f.render_widget(shared_key_widget, chunks[1]);
 
             // Input field
@@ -233,6 +248,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app:
                             }
                             app.input.clear();
                         }
+                    }
+                    // Toggle shared key visibility when Tab is pressed
+                    KeyCode::Tab => {
+                        app.is_shared_key_visible = !app.is_shared_key_visible;
                     }
                     _ => {}
                 }
