@@ -46,7 +46,7 @@ cargo run -- -s yourprivatekeyhere -p whoyouwanttotalkpubkeyhere
 ```
 
 For a read-only observer the application requires the conversation key:
-```
+```text
     -k, --conversation-key <CONVERSATION_KEY>: Conversation key K_conv (hex).
     -a, --author <AUTHOR>: Optional pub(K_sign) (hex), to filter by author instead of by tag.
 ```
@@ -60,7 +60,7 @@ cargo run -- -k conversationkeyhere
 hands a dispute solver the transcript without also handing over the ability to
 write into it. Press `Tab` in participant mode to reveal the key to share.
 
-## Usage
+## Keyboard Controls
 
 Once the application is running:
 
@@ -89,7 +89,9 @@ The following constants in the code can be modified:
 
 **Message encryption:** A kind 1 event carrying the message is signed with the sender's own key, NIP-44 encrypted under `K_conv`, and placed in the content of a **kind 14** event signed with `K_sign`. There is no gift wrap and no ephemeral key.
 
-**Event subscription:** Subscribes filtering by `authors = [pub(K_sign)]`. Only someone holding a party's private key can produce that signature, so the relay drops everything else. Filtering by the `p` tag instead would let anyone who has observed that tag flood the conversation.
+**Event subscription:** Subscribes filtering by `authors = [pub(K_sign)]`, bounded to the display window with `since`. Only someone holding a party's private key can produce that signature, so the relay drops everything else. Filtering by the `p` tag instead would let anyone who has observed that tag flood the conversation.
+
+That guarantee needs the author key, which participants always derive. An observer started with `-k` alone cannot — `K_sign` is not recoverable from `K_conv` — so it falls back to a `#p` filter on `pub(K_conv)` and does receive third-party events, discarding them when they fail to decrypt. Pass `-a pub(K_sign)` to get the same relay-side filtering participants have.
 
 **Validation:** Incoming events are checked cheapest-first — author, `p` tag, timestamp bounds, size, duplicates, rate limit — before any decryption, and the inner signature is what authenticates the sender.
 

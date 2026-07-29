@@ -22,7 +22,7 @@ use ratatui::{
 };
 use sha2::Sha256;
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     io,
     str::FromStr,
     sync::{Arc, Mutex},
@@ -50,6 +50,12 @@ const MAX_CONTENT_BYTES: usize = 64 * 1024;
 /// Token bucket: sustained rate and burst, per the spec's recommendation.
 const RATE_PER_MINUTE: f64 = 30.0;
 const RATE_BURST: f64 = 60.0;
+
+/// Capacity of the outer-event id cache. It must be bounded: in observer mode
+/// without an author locator the subscription falls back to a `p` tag filter,
+/// which anyone can publish to, so an unbounded cache is a memory-exhaustion
+/// target.
+const SEEN_OUTER_CAP: usize = 4096;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -132,6 +138,43 @@ impl RateLimiter {
         } else {
             false
         }
+    }
+}
+
+/// Fixed-capacity set of recently seen event ids, evicting oldest first.
+///
+/// Only used for the *outer* id, which the spec describes as a cheap
+/// pre-decryption filter against duplicate relay deliveries and gives no
+/// security role — so dropping old entries is safe. Inner ids are kept
+/// separately and unbounded, since only events that decrypt under `K_conv`
+/// ever reach that set and replay protection depends on it.
+struct RecentIds {
+    set: HashSet<EventId>,
+    order: VecDeque<EventId>,
+    cap: usize,
+}
+
+impl RecentIds {
+    fn new(cap: usize) -> Self {
+        Self {
+            set: HashSet::new(),
+            order: VecDeque::with_capacity(cap),
+            cap,
+        }
+    }
+
+    /// Records `id`, returning `true` when it had not been seen.
+    fn insert(&mut self, id: EventId) -> bool {
+        if !self.set.insert(id) {
+            return false;
+        }
+        self.order.push_back(id);
+        if self.order.len() > self.cap
+            && let Some(evicted) = self.order.pop_front()
+        {
+            self.set.remove(&evicted);
+        }
+        true
     }
 }
 
@@ -417,13 +460,21 @@ async fn run_nostr(
         .as_ref()
         .map(|k| k.public_key())
         .or(author_locator);
+    // Bound the backlog, as the spec requires. Without it the relay replays the
+    // whole stored history on every start, which both defeats the live rate
+    // limit — a burst larger than the bucket is silently truncated — and lets a
+    // past flood be re-downloaded on every launch. The UI only renders the last
+    // N_SECONDS, so that window is the natural cursor.
+    let since = Timestamp::from(Timestamp::now().as_secs().saturating_sub(N_SECONDS));
     let filter = match expected_author {
         Some(author) => nostr_sdk::Filter::new()
             .kind(Kind::PrivateDirectMessage)
-            .author(author),
+            .author(author)
+            .since(since),
         None => nostr_sdk::Filter::new()
             .kind(Kind::PrivateDirectMessage)
-            .pubkey(conv_keys.public_key()),
+            .pubkey(conv_keys.public_key())
+            .since(since),
     };
     if let Err(e) = client.subscribe(filter, None).await {
         eprintln!("Error subscribing: {}", e);
@@ -439,6 +490,8 @@ async fn run_nostr(
     if let (Some(sender), Some(sign_keys)) = (sender, sign_keys.clone()) {
         let client_clone = client.clone();
         let conv_clone = conv_keys.clone();
+        let messages_clone = messages.clone();
+        let own = sender.public_key();
         if let Some(mut rx) = rx {
             tokio::spawn(async move {
                 while let Some(message) = rx.recv().await {
@@ -446,7 +499,12 @@ async fn run_nostr(
                         send_message(&client_clone, &sender, &conv_clone, &sign_keys, &message)
                             .await
                     {
-                        eprintln!("Error sending message: {}", e);
+                        // The terminal is in alternate-screen mode, so stderr is
+                        // invisible: a failed send has to reach the message list
+                        // or the user believes it went through.
+                        if let Ok(mut messages) = messages_clone.lock() {
+                            messages.push((Timestamp::now(), own, format!("[not delivered] {e}")));
+                        }
                     }
                 }
             });
@@ -455,7 +513,7 @@ async fn run_nostr(
 
     // Per-conversation state the validator needs but does not own.
     let mut limiter = RateLimiter::new();
-    let mut seen_outer: HashSet<EventId> = HashSet::new();
+    let mut seen_outer = RecentIds::new(SEEN_OUTER_CAP);
     let mut seen_inner: HashSet<EventId> = HashSet::new();
 
     let mut notifications = client.notifications();
@@ -549,6 +607,13 @@ pub async fn mostro_wrap(
         inner.as_json(),
         nip44::Version::V2,
     )?;
+
+    // Same bound the receiver applies, enforced here too: publishing an event
+    // every recipient will drop would leave the message on our screen while
+    // being silently absent for the peer.
+    if content.len() > MAX_CONTENT_BYTES {
+        return Err("message is too large to send".into());
+    }
 
     // Exactly one `p` tag, ours. A caller-supplied one could hide the message
     // from the `#p` query a dispute solver uses to rebuild the transcript.
