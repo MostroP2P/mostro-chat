@@ -430,6 +430,11 @@ async fn run_nostr(
         return;
     }
 
+    // Our own messages come back on this subscription: we author with the very
+    // same K_sign the peer does, so the author filter cannot tell them apart.
+    // They are already in the list, added when they were typed.
+    let own_pubkey = sender.as_ref().map(|k| k.public_key());
+
     // Handle outgoing messages (participant mode only)
     if let (Some(sender), Some(sign_keys)) = (sender, sign_keys.clone()) {
         let client_clone = client.clone();
@@ -483,6 +488,11 @@ async fn run_nostr(
         // that persists history MUST persist these ids with it, since an entry
         // that disappears makes its message replayable again.
         if !seen_inner.insert(inner.id) {
+            continue;
+        }
+
+        // Drop the echo of our own message (see `own_pubkey` above).
+        if Some(inner.pubkey) == own_pubkey {
             continue;
         }
 
@@ -721,6 +731,39 @@ mod tests {
             alice().public_key(),
             "inner identifies the sender"
         );
+    }
+
+    #[tokio::test]
+    async fn the_published_event_never_carries_a_party_pubkey() {
+        // Arrange
+        let ((a_conv, a_sign), _) = both_sides();
+
+        // Act
+        let outer = mostro_wrap(&alice(), &a_conv, &a_sign, "hello bob", vec![])
+            .await
+            .unwrap();
+        let published = outer.as_json();
+
+        // Assert: everything an observer can read is a per-conversation key.
+        assert_eq!(outer.pubkey, a_sign.public_key());
+        assert!(
+            !published.contains(&alice().public_key().to_hex()),
+            "sender pubkey leaked into the published event"
+        );
+        assert!(
+            !published.contains(&bob().public_key().to_hex()),
+            "recipient pubkey leaked into the published event"
+        );
+        // The sender is only recoverable after decrypting with K_conv.
+        let inner = mostro_unwrap(
+            &a_conv,
+            Some(&a_sign.public_key()),
+            Some(&parties()),
+            &outer,
+            Timestamp::now(),
+        )
+        .unwrap();
+        assert_eq!(inner.pubkey, alice().public_key());
     }
 
     #[tokio::test]
