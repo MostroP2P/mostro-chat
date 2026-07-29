@@ -9,8 +9,13 @@ homepage = "https://mostro.network"
 repository = "https://github.com/MostroP2P/mostro-chat"
 
 [dependencies]
-crossterm = { version = "0.28.1", features = ["event-stream"] }
-ratatui = "0.29.0"
-tokio = { version = "1.44.1", features = ["full"] }
-nostr-sdk = { version = "0.40.0", features = ["nip44", "nip59"] }
-clap = { version = "4.5.32", features = ["derive"] }
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+ratatui = "0.30.2"
+tokio = { version = "1.53.1", features = ["full"] }
+# 0.44.1 is the newest stable release: 0.45.0-alpha.7 exists but is a
+# pre-release, and this crate is published. The `nip59` feature is gone along
+# with gift wrap.
+nostr-sdk = { version = "0.44.1", features = ["nip44"] }
+clap = { version = "4.6.4", features = ["derive"] }
+hkdf = "0.13.0"
+sha2 = "0.11.0"
