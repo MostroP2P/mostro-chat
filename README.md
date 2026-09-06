@@ -106,7 +106,7 @@ Asynchronous Handling: Employs tokio for managing Nostr client tasks and TUI upd
 You can find more information about [here](https://mostro.network/protocol/chat.html)
 
 ## License
-This project is licensed under the MIT License. See the LICENSE file for details.
+This project is licensed under the GNU General Public License v3.0. See the LICENSE file for details.
 
 ## Contributing
 Contributions are encouraged! Feel free to open issues or submit pull requests on GitHub.
