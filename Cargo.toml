@@ -2,7 +2,7 @@
 name = "mostro-chat"
 version = "0.2.1"
 edition = "2024"
-license = "MIT"
+license = "GPL-3.0-only"
 authors = ["Francisco Calderón <fjcalderon@gmail.com>"]
 description = "Minimalist peer-to-peer chat application written in Rust, utilizing the Nostr protocol for decentralized and secure communication"
 homepage = "https://mostro.network"
